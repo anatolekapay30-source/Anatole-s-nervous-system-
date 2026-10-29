@@ -526,6 +526,24 @@
       </label>
     </div>
     <div class="toggle-row">
+      <label class="toggle-label" for="tog-skeleton">
+        <span class="toggle-dot" style="background:#e3d8bf"></span>Skeleton (Spine &amp; Ribs)
+      </label>
+      <label class="toggle-switch">
+        <input type="checkbox" id="tog-skeleton" checked aria-label="Toggle skeleton visibility">
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+    <div class="toggle-row">
+      <label class="toggle-label" for="tog-xray">
+        <span class="toggle-dot" style="background:#9ca3af"></span>Bone X-ray
+      </label>
+      <label class="toggle-switch">
+        <input type="checkbox" id="tog-xray" aria-label="Make bones see-through">
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+    <div class="toggle-row">
       <label class="toggle-label" for="tog-labels">
         <span class="toggle-dot" style="background:#d1d5db"></span>Labels
       </label>
@@ -598,6 +616,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { mergeVertices, mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 /* ─────────────────────────────────────────────
    ANATOMICAL DATA
@@ -773,7 +792,7 @@ scene.add(pointA);
 // Studio environment map — gives glossy wet-tissue surfaces real reflections
 // instead of the flat, plasticky look of unlit specular highlights.
 const pmremGen = new THREE.PMREMGenerator(renderer);
-scene.environment = pmremGen.fromScene(new RoomEnvironment(), 0.09).texture;
+scene.environment = pmremGen.fromScene(new RoomEnvironment(), 0.04).texture;
 
 /* ─────────────────────────────────────────────
    PROCEDURAL NOISE — for organic tissue surface detail
@@ -842,114 +861,395 @@ function bakeFoldShading(geometry, shadeValues, { shadowDarken = 0.42, liftBrigh
   geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 }
 
-function mirrorPts(pts, mirror) { return pts.map((p) => (mirror ? new THREE.Vector3(-p.x, p.y, p.z) : p.clone())); }
+/* ─────────────────────────────────────────────
+   ORGANIC GEOMETRY BUILDERS
+   Dense, seam-free meshes with real surface relief + baked
+   per-vertex colour (crowns light, grooves dark, vessels red).
+───────────────────────────────────────────── */
+const smoothstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+const clamp01 = (x) => Math.min(1, Math.max(0, x));
+const toLinear = (c) => Math.pow(c, 2.2);          // sRGB-ish -> linear for vertex colours
+function setVertexColor(arr, i, r, g, b) { arr[i * 3] = toLinear(clamp01(r)); arr[i * 3 + 1] = toLinear(clamp01(g)); arr[i * 3 + 2] = toLinear(clamp01(b)); }
 
-// Named sulci/fissures, hand-placed in local hemisphere space (calibrated for
-// a ~1.3-radius sphere; sculptHemisphereGeometry rescales to fit whatever
-// radius it's given). Defined for the RIGHT hemisphere; mirrored for the left.
-const SULCI_TEMPLATE = [
-  [new THREE.Vector3(0.32,1.30,0.18), new THREE.Vector3(0.65,1.05,0.10), new THREE.Vector3(1.00,0.65,0.02), new THREE.Vector3(1.28,0.15,-0.05)], // central sulcus
-  [new THREE.Vector3(0.55,0.50,0.95), new THREE.Vector3(0.95,0.30,0.55), new THREE.Vector3(1.25,0.12,0.05), new THREE.Vector3(1.20,0.08,-0.45)], // lateral (Sylvian) fissure
-  [new THREE.Vector3(0.25,0.95,-0.95), new THREE.Vector3(0.55,0.55,-1.15), new THREE.Vector3(0.75,0.15,-1.20)], // parieto-occipital sulcus
-  [new THREE.Vector3(0.15,1.15,0.75), new THREE.Vector3(0.35,1.00,0.30), new THREE.Vector3(0.50,0.75,-0.05)], // superior frontal sulcus
-];
+// Indexed, seam-free icosphere (uniform triangles = ideal for displacement)
+function weldedIcosphere(detail) {
+  let g = new THREE.IcosahedronGeometry(1, detail);
+  g.deleteAttribute('normal');
+  g.deleteAttribute('uv');
+  return mergeVertices(g, 1e-4);
+}
 
-// Carves the real named sulci as continuous grooves, layers finer randomized
-// tertiary gyri on top, flattens the medial face where the hemispheres meet
-// at the longitudinal fissure, and bakes shadow/highlight vertex shading.
-// mirror=true builds the LEFT hemisphere, mirror=false the RIGHT.
-function sculptHemisphereGeometry(radius, wSeg, hSeg, mirror, seed) {
-  const geo = new THREE.SphereGeometry(radius, wSeg, hSeg);
-  const scaleF = radius / 1.3;
-  const grooves = SULCI_TEMPLATE.map((pts) => mirrorPts(pts, mirror).map((p) => p.multiplyScalar(scaleF)));
-  const pos = geo.attributes.position;
-  const v = new THREE.Vector3();
-  const shade = new Float32Array(pos.count);
-
-  for (let i = 0; i < pos.count; i++) {
-    v.fromBufferAttribute(pos, i);
-    const len = v.length() || 1;
-    const nx = v.x / len, ny = v.y / len, nz = v.z / len;
-
-    let majorDip = 0;
-    for (const g of grooves) {
-      const d = distToPolyline(v, g);
-      majorDip = Math.max(majorDip, 0.115 * scaleF * Math.exp(-(d * d) / (2 * 0.15 * scaleF * 0.15 * scaleF)));
-    }
-
-    const n = fbm3(v.x * 2.6 + seed, v.y * 2.6 + seed * 1.7, v.z * 2.6 + seed * 2.3, 5);
-    const ridge = Math.pow(1 - Math.abs(n), 1.6);
-    const minorDisp = (n * 0.4 + ridge * (n >= 0 ? 0.5 : -0.5)) * 0.04 * scaleF;
-
-    const total = minorDisp - majorDip;
-    pos.setXYZ(i, v.x + nx * total, v.y + ny * total, v.z + nz * total);
-    shade[i] = minorDisp - majorDip * 1.8;
+// Scalar distance from (px,py,pz) to a polyline of [x,y,z] points (no allocations)
+function polyDist(px, py, pz, pts) {
+  let best = 1e9;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+    const apx = px - a[0], apy = py - a[1], apz = pz - a[2];
+    const t = clamp01((apx * abx + apy * aby + apz * abz) / (abx * abx + aby * aby + abz * abz || 1));
+    const dx = apx - abx * t, dy = apy - aby * t, dz = apz - abz * t;
+    const d = dx * dx + dy * dy + dz * dz;
+    if (d < best) best = d;
   }
-  pos.needsUpdate = true;
+  return Math.sqrt(best);
+}
 
-  // Flatten the medial face (where this hemisphere presses against its twin
-  // along the longitudinal fissure) so they sit together like real hemispheres
-  // instead of two spheres just touching at a point.
-  const medialSign = mirror ? 1 : -1;
-  const flatAt = 0.22 * scaleF;
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i);
-    if (medialSign > 0 ? x > flatAt : x < -flatAt) {
-      pos.setX(i, THREE.MathUtils.lerp(x, medialSign * flatAt, 0.7));
-    }
-  }
-  pos.needsUpdate = true;
-
+// Pushes every vertex along its (base-shape) normal by disp(i), then recomputes normals
+function displaceAlongNormals(geo, dispFn) {
   geo.computeVertexNormals();
-  bakeFoldShading(geo, shade);
+  const pos = geo.attributes.position, nor = geo.attributes.normal;
+  for (let i = 0; i < pos.count; i++) {
+    const d = dispFn(i, pos.getX(i), pos.getY(i), pos.getZ(i));
+    pos.setXYZ(i, pos.getX(i) + nor.getX(i) * d, pos.getY(i) + nor.getY(i) * d, pos.getZ(i) + nor.getZ(i) * d);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+}
+
+// Lofted closed tube with end caps: fn(t, theta) -> [x,y,z]; t = 0..1 along the length
+function loftGeometry(rows, segs, fn) {
+  const positions = [], indices = [];
+  for (let r = 0; r <= rows; r++) for (let s = 0; s < segs; s++) {
+    const p = fn(r / rows, (s / segs) * Math.PI * 2);
+    positions.push(p[0], p[1], p[2]);
+  }
+  for (let r = 0; r < rows; r++) for (let s = 0; s < segs; s++) {
+    const a = r * segs + s, b = r * segs + (s + 1) % segs, c = (r + 1) * segs + s, d = (r + 1) * segs + (s + 1) % segs;
+    indices.push(a, b, c, b, d, c);
+  }
+  // caps
+  for (const [row, flip] of [[0, true], [rows, false]]) {
+    let cx = 0, cy = 0, cz = 0;
+    for (let s = 0; s < segs; s++) { const k = (row * segs + s) * 3; cx += positions[k]; cy += positions[k + 1]; cz += positions[k + 2]; }
+    const ci = positions.length / 3;
+    positions.push(cx / segs, cy / segs, cz / segs);
+    for (let s = 0; s < segs; s++) {
+      const a = row * segs + s, b = row * segs + (s + 1) % segs;
+      if (flip) indices.push(ci, b, a); else indices.push(ci, a, b);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  g.setIndex(indices);
+  g.computeVertexNormals();
+  return g;
+}
+function keyframe(keys, vals, t) {                   // smooth interpolation through keyframes
+  if (t <= keys[0]) return vals[0];
+  for (let i = 1; i < keys.length; i++) if (t <= keys[i]) {
+    const u = smoothstep(keys[i - 1], keys[i], t);
+    return vals[i - 1] + (vals[i] - vals[i - 1]) * u;
+  }
+  return vals[vals.length - 1];
+}
+
+/* ─── CEREBRAL HEMISPHERE ─── */
+const BRAIN_CY = 5.45;
+const SYLVIAN  = [[0.50,-0.32,0.84],[0.80,-0.14,0.52],[0.95,0.00,0.12],[0.93,0.10,-0.30],[0.80,0.24,-0.56]].map((p) => { const l = Math.hypot(...p); return p.map((c) => c / l); });
+const ROLANDIC = [[0.08,0.99,-0.06],[0.42,0.90,-0.02],[0.74,0.64,0.06],[0.90,0.38,0.14]].map((p) => { const l = Math.hypot(...p); return p.map((c) => c / l); });
+const CROWN_COL  = [0.88, 0.57, 0.54];   // pink gyral crowns
+const GROOVE_COL = [0.52, 0.20, 0.21];   // deep reddish sulci
+
+function gyriField(px, py, pz, seed) {                // smooth warped field; its contour lines become the winding gyri
+  const wx = fbm3(px * 1.0 + seed, py * 1.0, pz * 1.0, 2);
+  const wy = fbm3(px * 1.0, py * 1.0 + seed + 17.3, pz * 1.0, 2);
+  const wz = fbm3(px * 1.0 + 31.7, py * 1.0, pz * 1.0 + seed, 2);
+  return fbm3(px * 2.0 + wx * 1.2, py * 2.0 + wy * 1.2, pz * 2.0 + wz * 1.2 + seed * 0.37, 3);
+}
+
+function buildHemisphere(side, { detail = 96, gyri = true, seed = 1 } = {}) {
+  const geo = weldedIcosphere(detail);
+  const pos = geo.attributes.position, n = pos.count;
+  const dirs = new Float32Array(n * 3);
+  const rx = 0.86, ry = 1.15, rz = 1.80, cx = 0.58;
+
+  for (let i = 0; i < n; i++) {
+    const dx = pos.getX(i), dy = pos.getY(i), dz = pos.getZ(i);
+    dirs[i * 3] = dx; dirs[i * 3 + 1] = dy; dirs[i * 3 + 2] = dz;
+    const l = dx * side;                                  // +lateral / -medial
+    const front = Math.max(0, dz), back = Math.max(0, -dz);
+    const narrow = 1 - 0.22 * Math.pow(front, 1.6) - 0.06 * back * back;
+    const mx = l >= 0 ? l * rx : -Math.pow(-l, 0.40) * rx; // near-vertical medial wall
+    let x = mx * narrow;
+    let y = dy * ry * (dy < 0 ? 0.80 : 1.0);
+    const z = dz * rz;
+    // temporal lobe: lateral-inferior bulge that hangs below the Sylvian fissure
+    const tb = Math.exp(-(Math.pow(l - 0.80, 2) / 0.18 + Math.pow(dy + 0.40, 2) / 0.14 + Math.pow(dz - 0.15, 2) / 0.30));
+    y -= tb * 0.30; x += tb * 0.08;
+    // orbital (frontal underside) sits higher than the temporal pole
+    if (dy < 0) y += 0.16 * smoothstep(0.25, 0.9, dz) * Math.min(1, -dy * 2.2);
+    // medial underside rises toward the midline (brainstem / thalamic region)
+    if (dy < 0) y += 0.22 * Math.exp(-(l * l) / 0.10) * Math.min(1, -dy * 2);
+    const L = Math.max(0.025, cx + x);
+    pos.setXYZ(i, side * L, BRAIN_CY + y, z);
+  }
+  pos.needsUpdate = true;
+
+  const colors = new Float32Array(n * 3);
+  if (gyri) {
+    displaceAlongNormals(geo, (i, px, py, pz) => {
+      const L = Math.abs(px);
+      const sField = gyriField(px, py, pz, seed);
+      const g1 = smoothstep(0.55, 1.0, Math.sin(sField * 38));    // primary sulci = bands of the contour pattern
+      const f2 = fbm3(px * 7 + sField * 1.5 + seed * 2.1, py * 7, pz * 7 + seed, 2);
+      const g2 = (1 - smoothstep(0, 0.09, Math.abs(f2))) * (1 - g1) * 0.5; // secondary sulci
+      const dx = dirs[i * 3] * side, dy = dirs[i * 3 + 1], dz = dirs[i * 3 + 2];
+      const sy = Math.exp(-Math.pow(polyDist(dx, dy, dz, SYLVIAN) / 0.085, 2));
+      const ro = Math.exp(-Math.pow(polyDist(dx, dy, dz, ROLANDIC) / 0.05, 2));
+      const mask = smoothstep(0.03, 0.30, L);                    // calm medial face
+      const dep = clamp01(g1 * 0.95 + g2 * 0.4 + sy + ro * 0.8) ;
+      // colour: crowns light, grooves dark, faint vessel tracing
+      const tint = fbm3(px * 1.7 + 9, py * 1.7, pz * 1.7, 2) * 0.07;
+      const ves = 1 - smoothstep(0, 0.028, Math.abs(fbm3(px * 7.5 + seed, py * 7.5 + 4.1, pz * 7.5, 2)));
+      const k = Math.pow(dep * mask + 0.0, 0.8);
+      let r = CROWN_COL[0] + (GROOVE_COL[0] - CROWN_COL[0]) * k + tint;
+      let g = CROWN_COL[1] + (GROOVE_COL[1] - CROWN_COL[1]) * k + tint * 0.6;
+      let b = CROWN_COL[2] + (GROOVE_COL[2] - CROWN_COL[2]) * k + tint * 0.6;
+      const vt = ves * 0.32 * (1 - k * 0.5);
+      r += (0.74 - r) * vt; g += (0.17 - g) * vt; b += (0.17 - b) * vt;
+      setVertexColor(colors, i, r, g, b);
+      return -(0.10 * g1 + 0.034 * g2) * mask - 0.17 * sy - 0.09 * ro + 0.012 * (1 - g1) * mask;
+    });
+  } else {
+    geo.computeVertexNormals();
+  }
+  // flatten the medial face so the hemispheres sit flush at the longitudinal fissure
+  for (let i = 0; i < n; i++) if (Math.abs(pos.getX(i)) < 0.035) pos.setX(i, side * 0.035);
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   return geo;
 }
 
-// Randomized ridged folding for the smaller accent lobes (frontal/temporal/
-// occipital bumps) where no single named sulcus dominates.
-function foldedSphereGeometry(radius, wSeg, hSeg, seed, amp, freq) {
-  const geo = new THREE.SphereGeometry(radius, wSeg, hSeg);
-  const pos = geo.attributes.position;
-  const v = new THREE.Vector3();
-  const a = amp ?? radius * 0.07, f = freq ?? 2.6;
-  const shade = new Float32Array(pos.count);
-  for (let i = 0; i < pos.count; i++) {
-    v.fromBufferAttribute(pos, i);
-    const len = v.length() || 1;
-    const nx = v.x / len, ny = v.y / len, nz = v.z / len;
-    const n = fbm3(v.x * f + seed, v.y * f + seed * 1.7, v.z * f + seed * 2.3, 5);
-    const ridge = Math.pow(1 - Math.abs(n), 1.6);
-    const disp = (n * 0.4 + ridge * (n >= 0 ? 0.5 : -0.5)) * a;
-    pos.setXYZ(i, v.x + nx * disp, v.y + ny * disp, v.z + nz * disp);
-    shade[i] = disp;
+/* ─── CEREBELLUM — two hemispheres + vermis with fine transverse folia ─── */
+const CEREB_C = { x: 0, y: 4.50, z: -1.10 };
+function buildCerebellum({ detail = 110, seed = 3 } = {}) {
+  const geo = weldedIcosphere(detail);
+  const pos = geo.attributes.position, n = pos.count;
+  const rx = 1.12, ry = 0.50, rz = 0.66;
+  for (let i = 0; i < n; i++) {
+    const dx = pos.getX(i), dy = pos.getY(i), dz = pos.getZ(i);
+    let x = Math.sign(dx) * Math.pow(Math.abs(dx), 0.85) * rx;
+    let y = dy * ry * (dy < 0 ? 0.80 : 1.0) * (1 - 0.30 * dx * dx);
+    let z = dz * rz;
+    z += 0.20 * Math.exp(-(x * x) / (2 * 0.13 * 0.13)) * smoothstep(0.3, 0.9, -dz);   // posterior cerebellar notch
+    z -= 0.26 * Math.exp(-(x * x) / (2 * 0.26 * 0.26)) * smoothstep(0.35, 0.9, dz);   // anterior bay for the brainstem
+    pos.setXYZ(i, CEREB_C.x + x, CEREB_C.y + y, CEREB_C.z + z);
   }
   pos.needsUpdate = true;
-  geo.computeVertexNormals();
-  bakeFoldShading(geo, shade, { shadowDarken: 0.3, liftBrighten: 0.06 });
+  const colors = new Float32Array(n * 3);
+  const N = 40;                                               // number of folia around the sagittal circumference
+  displaceAlongNormals(geo, (i, px, py, pz) => {
+    const xl = px - CEREB_C.x, yl = py - CEREB_C.y, zl = pz - CEREB_C.z;
+    const psi = Math.atan2(yl / ry, zl / rz);                // folia = lines of constant angle about the lateral axis
+    const warp = 0.10 * (xl / rx) * (xl / rx) + 0.05 * fbm3(xl * 2.2 + seed, yl * 2.2, zl * 2.2, 2);
+    const phi = N * (psi + warp);
+    const u = 0.5 + 0.5 * Math.sin(phi);
+    const deep = 0.65 + 0.35 * Math.cos(phi / 6.5 + 1.3);    // some fissures run deeper than others
+    const crest = Math.pow(u, 0.6);
+    const k = 1 - crest;
+    const r = 0.92 + (0.56 - 0.92) * k, g = 0.60 + (0.27 - 0.60) * k, b = 0.52 + (0.25 - 0.52) * k;
+    setVertexColor(colors, i, r, g, b);
+    return 0.026 * deep * (crest - 1);
+  });
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   return geo;
 }
 
-// Fine, roughly-parallel ridging for cerebellar folia, with matching shading.
-function foliaSphereGeometry(radius, wSeg, hSeg, seed, amp, freq, axis) {
-  const geo = new THREE.SphereGeometry(radius, wSeg, hSeg);
-  const pos = geo.attributes.position;
-  const v = new THREE.Vector3();
-  const a = amp ?? radius * 0.045, f = freq ?? 16, ax = axis ?? 'x';
-  const shade = new Float32Array(pos.count);
+/* ─── BRAINSTEM — midbrain, pons, medulla with pyramids/olives, cream white matter ─── */
+function buildBrainstem() {
+  const yTop = 4.85, yBot = 3.28;
+  const T = [0, 0.12, 0.30, 0.45, 0.58, 0.72, 1.0];
+  const RX = [0.27, 0.31, 0.46, 0.42, 0.30, 0.25, 0.20];
+  const ZC = [0.14, 0.16, 0.26, 0.24, 0.18, 0.12, 0.10];
+  const RA = [0.27, 0.30, 0.50, 0.44, 0.30, 0.25, 0.20];   // anterior radius (pons bulges forward)
+  const RP = [0.27, 0.28, 0.30, 0.30, 0.26, 0.22, 0.20];   // posterior radius
+  const geo = loftGeometry(150, 72, (t, th) => {
+    const c = Math.cos(th), s = Math.sin(th);
+    const ant = s > 0 ? 1 : 0, antSoft = smoothstep(-0.1, 0.35, s);
+    const rx = keyframe(T, RX, t), zc = keyframe(T, ZC, t);
+    const rz = s > 0 ? keyframe(T, RA, t) : keyframe(T, RP, t);
+    let sc = 1;
+    const ax = Math.abs(c * rx);
+    const med = smoothstep(0.50, 0.66, t), pons = smoothstep(0.18, 0.30, t) * (1 - smoothstep(0.46, 0.56, t));
+    const mid = 1 - smoothstep(0.10, 0.22, t);
+    sc -= 0.10 * Math.exp(-Math.pow(ax / 0.035, 2)) * antSoft * med;                       // anterior median fissure
+    sc += 0.06 * Math.exp(-Math.pow((ax - 0.10) / 0.04, 2)) * antSoft * med;               // pyramids
+    sc += 0.07 * Math.exp(-Math.pow((Math.abs(c) - 0.80) / 0.12, 2)) * Math.exp(-Math.pow((t - 0.64) / 0.07, 2)) * antSoft; // olives
+    sc += 0.012 * Math.sin(t * 190) * antSoft * pons;                                       // transverse pontine fibres
+    sc -= 0.05 * Math.exp(-Math.pow(ax / 0.05, 2)) * antSoft * pons;                        // basilar groove
+    sc += 0.05 * Math.exp(-Math.pow((ax - 0.12) / 0.04, 2)) * antSoft * mid;                // cerebral peduncles
+    sc += 0.006 * Math.sin(th * 26 + t * 9);                                                // fine longitudinal striation
+    return [c * rx * sc, yTop + (yBot - yTop) * t, zc + s * rz * sc];
+  });
+  const pos = geo.attributes.position, colors = new Float32Array(pos.count * 3);
   for (let i = 0; i < pos.count; i++) {
-    v.fromBufferAttribute(pos, i);
-    const len = v.length() || 1;
-    const nx = v.x / len, ny = v.y / len, nz = v.z / len;
-    const coord = ax === 'x' ? v.x : ax === 'y' ? v.y : v.z;
-    const jitter = fbm3(v.x * 3 + seed, v.y * 3 + seed, v.z * 3 + seed, 2) * 0.35;
-    const ridge = Math.sin(coord * f + jitter * 3);
-    const disp = ridge * a;
-    pos.setXYZ(i, v.x + nx * disp, v.y + ny * disp, v.z + nz * disp);
-    shade[i] = disp;
+    const nz = fbm3(pos.getX(i) * 6, pos.getY(i) * 6, pos.getZ(i) * 6, 2) * 0.05;
+    setVertexColor(colors, i, 0.91 + nz, 0.84 + nz, 0.70 + nz);
   }
-  pos.needsUpdate = true;
-  geo.computeVertexNormals();
-  bakeFoldShading(geo, shade, { shadowDarken: 0.35, liftBrighten: 0.08 });
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  return geo;
+}
+
+// Dense meshes get a low-poly stand-in for raycasting, so hover stays instant
+function setRaycastProxy(mesh, proxyGeo) {
+  const proxy = new THREE.Mesh(proxyGeo, mesh.material);
+  mesh.raycast = function (raycaster, intersects) {
+    proxy.matrixWorld.copy(this.matrixWorld);
+    const hits = [];
+    THREE.Mesh.prototype.raycast.call(proxy, raycaster, hits);
+    for (const h of hits) { h.object = this; intersects.push(h); }
+  };
+}
+
+/* ─────────────────────────────────────────────
+   SKELETON — vertebral column + ribs (procedural, merged into one mesh)
+   Local frame per vertebra: y up, z anterior, spinal canal centred on z = 0.
+───────────────────────────────────────────── */
+function mergeParts(arr) {
+  arr.forEach((g) => { if (g.attributes.uv) g.deleteAttribute('uv'); });
+  const m = mergeGeometries(arr);
+  if (!m) throw new Error('Skeleton parts could not be merged (attribute mismatch)');
+  return m;
+}
+function xf(g, p = [0, 0, 0], r = [0, 0, 0], s = [1, 1, 1]) {
+  const m = new THREE.Matrix4().compose(new THREE.Vector3(...p), new THREE.Quaternion().setFromEuler(new THREE.Euler(...r)), new THREE.Vector3(...s));
+  g.applyMatrix4(m);
+  return g;
+}
+function bBox(w, h, d, p, r) { return xf(new THREE.BoxGeometry(w, h, d, 2, 2, 2), p, r); }
+function bBall(rad, p, s = [1, 1, 1]) { return xf(new THREE.SphereGeometry(rad, 12, 9), p, [0, 0, 0], s); }
+function bLimb(a, b, r0, r1, seg = 9) {                 // tapered rod from point a (radius r0) to point b (radius r1)
+  const A = new THREE.Vector3(...a), B = new THREE.Vector3(...b), dir = B.clone().sub(A), len = dir.length();
+  const g = new THREE.CylinderGeometry(r1, r0, len, seg, 1);
+  const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+  g.applyMatrix4(new THREE.Matrix4().compose(A.clone().add(B).multiplyScalar(0.5), q, new THREE.Vector3(1, 1, 1)));
+  return g;
+}
+function bBody(rx, rz, h, p) {                          // waisted vertebral body with raised rims
+  const prof = [[0.001, -h / 2], [0.90, -h / 2], [1.0, -h * 0.36], [0.85, 0], [1.0, h * 0.36], [0.90, h / 2], [0.001, h / 2]].map(([r, y]) => new THREE.Vector2(r, y));
+  return xf(new THREE.LatheGeometry(prof, 28), p, [0, 0, 0], [rx, 1, rz]);
+}
+// type: 'C' | 'T' | 'L'  ·  k = index within region · sc = overall scale
+function makeVertebra(type, k, sc) {
+  const P = [];
+  if (type === 'C') {
+    const sp = k === 6 ? 0.62 : 0.40;                  // C7 = vertebra prominens (long spinous process)
+    P.push(bBody(0.18, 0.15, 0.17, [0, 0, 0.36]));
+    for (const s of [-1, 1]) {
+      P.push(bLimb([s * 0.20, 0, 0.26], [s * 0.21, 0, -0.04], 0.045, 0.045));         // pedicle
+      P.push(bLimb([s * 0.21, 0, -0.03], [s * 0.08, 0, -0.25], 0.04, 0.04));          // lamina
+      P.push(bLimb([s * 0.21, -0.01, 0.02], [s * 0.40, -0.02, 0.10], 0.045, 0.034));  // transverse process
+      P.push(bBall(0.045, [s * 0.40, -0.02, 0.10]));
+      P.push(bBox(0.09, 0.07, 0.08, [s * 0.22, 0.08, -0.08]));                        // articular pillar
+    }
+    P.push(bLimb([0, 0.02, -0.25], [0, -0.05, -sp], 0.05, 0.028));
+  } else if (type === 'T') {
+    P.push(bBody(0.24, 0.20, 0.20, [0, 0, 0.42]));
+    for (const s of [-1, 1]) {
+      P.push(bLimb([s * 0.25, 0, 0.30], [s * 0.26, 0, -0.04], 0.055, 0.05));          // pedicle
+      P.push(bBox(0.34, 0.20, 0.05, [s * 0.155, 0, -0.17], [0, -s * 0.74, 0]));                // lamina
+      P.push(bLimb([s * 0.24, 0.02, -0.07], [s * 0.54, 0.04, -0.20], 0.055, 0.062));  // transverse process
+      P.push(bBall(0.075, [s * 0.55, 0.04, -0.20], [1, 0.9, 1]));                      // costal facet
+      P.push(bBox(0.10, 0.10, 0.08, [s * 0.22, 0.13, -0.10]));                         // superior articular
+      P.push(bBox(0.09, 0.09, 0.08, [s * 0.17, -0.12, -0.24]));                        // inferior articular
+      P.push(bBall(0.04, [s * 0.30, 0.0, 0.33]));                                      // costal demifacet on body
+    }
+    const g = bLimb([0, 0.05, -0.30], [0, -0.22, -0.68], 0.058, 0.034);                 // long, down-slanting spinous process
+    P.push(xf(g, [0, 0, 0], [0, 0, 0], [0.75, 1, 1]));
+  } else {
+    P.push(bBody(0.31, 0.25, 0.27, [0, 0, 0.46]));
+    for (const s of [-1, 1]) {
+      P.push(bLimb([s * 0.27, 0, 0.32], [s * 0.28, 0, -0.04], 0.07, 0.06));
+            P.push(bBox(0.34, 0.25, 0.06, [s * 0.165, 0, -0.17], [0, -s * 0.76, 0]));
+      P.push(bLimb([s * 0.26, 0, -0.04], [s * 0.64, 0.0, -0.16], 0.05, 0.036));        // long slender transverse process
+      P.push(bBox(0.12, 0.14, 0.10, [s * 0.23, 0.15, -0.10]));
+      P.push(bBox(0.11, 0.12, 0.10, [s * 0.18, -0.15, -0.26]));
+    }
+    P.push(bBox(0.085, 0.26, 0.30, [0, -0.01, -0.46]));                                 // broad, blocky spinous process
+  }
+  return xf(mergeParts(P), [0, 0, 0], [0, 0, 0], [sc, sc, sc]);
+}
+function makeAtlas() {                                   // C1 — a ring with broad lateral masses
+  const P = [xf(new THREE.TorusGeometry(0.27, 0.05, 10, 28), [0, 0, 0.04], [Math.PI / 2, 0, 0], [1, 1.05, 1])];
+  for (const s of [-1, 1]) {
+    P.push(bBall(0.09, [s * 0.27, 0, 0.04], [1, 0.8, 1.2]));
+    P.push(bLimb([s * 0.27, 0, 0.04], [s * 0.50, 0, 0.0], 0.045, 0.04));
+    P.push(bBall(0.04, [s * 0.50, 0, 0.0]));
+  }
+  P.push(bBox(0.07, 0.07, 0.10, [0, 0, -0.30]));
+  return mergeParts(P);
+}
+function makeAxis() {                                    // C2 — with the odontoid peg (dens)
+  const P = [bBody(0.19, 0.16, 0.20, [0, 0, 0.34]), bLimb([0, 0.08, 0.34], [0, 0.30, 0.34], 0.07, 0.05), bBall(0.05, [0, 0.30, 0.34])];
+  for (const s of [-1, 1]) {
+    P.push(bLimb([s * 0.20, 0, 0.26], [s * 0.21, 0, -0.04], 0.05, 0.05), bLimb([s * 0.21, 0, -0.03], [s * 0.06, 0, -0.26], 0.045, 0.04), bLimb([s * 0.21, -0.01, 0.02], [s * 0.38, -0.02, 0.08], 0.045, 0.034));
+  }
+  P.push(xf(bLimb([0, 0.02, -0.26], [0, -0.04, -0.50], 0.06, 0.04), [0, 0, 0], [0, 0, 0], [1.3, 1, 1]));
+  return mergeParts(P);
+}
+
+function makeSacrum(yTop, yBot) {
+  const g = loftGeometry(48, 40, (t, th) => {
+    const c = Math.cos(th), s = Math.sin(th);
+    const hw = 0.60 * (1 - 0.74 * Math.pow(t, 1.15)), depth = 0.28 * (1 - 0.55 * t);
+    const zc = 0.30 + 0.28 * t * t;
+    const x = Math.sign(c) * Math.pow(Math.abs(c), 0.6) * hw;
+    let z = zc + s * depth;
+    if (s < 0) z -= 0.07 * Math.exp(-(x * x) / 0.012);                                     // median sacral crest
+    const ridge = 0.012 * Math.sin(t * Math.PI * 8);                                       // fusion lines of S1–S5
+    return [x * (1 + ridge), yTop + (yBot - yTop) * t, z];
+  });
+  return g;
+}
+
+const RIB_F = [0.55, 0.68, 0.80, 0.88, 0.94, 0.98, 1.0, 1.0, 0.97, 0.90, 0.70, 0.55];
+function makeRib(y, i, s) {
+  const f = RIB_F[i], d = 0.10 + 0.09 * i;
+  const pts = [
+    [s * 0.30, y, -0.18], [s * 0.54, y + 0.01, -0.24],
+    [s * (0.54 + 0.45 * f), y - 0.35 * d, -0.40 * f - 0.05],
+    [s * (0.54 + 0.95 * f), y - 0.85 * d - 0.10, -0.30 * f],
+    [s * (0.54 + 1.15 * f), y - 1.50 * d - 0.20, 0.05 * f],
+    [s * (0.54 + 1.05 * f), y - 2.20 * d - 0.35, 0.38 * f],
+  ].map((p) => new THREE.Vector3(...p));
+  const curve = new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.5);
+  const g = new THREE.TubeGeometry(curve, 56, 0.040, 8, false);
+  const tip = pts[pts.length - 1];
+  return mergeParts([g, bBall(0.060, [pts[0].x, pts[0].y, pts[0].z]), bBall(0.045, [tip.x, tip.y, tip.z])]);
+}
+
+function buildSkeletonGeometry() {
+  const parts = [];
+  const place = (g, y) => { g.translate(0, y, 0); parts.push(g); };
+  // cervical: C1 (atlas), C2 (axis), C3–C7
+  place(makeAtlas(), 3.02);
+  place(makeAxis(), 2.76);
+  for (let k = 0; k < 5; k++) place(makeVertebra('C', k + 2, 0.86 + k * 0.01), 2.46 - k * 0.31);
+  // thoracic T1–T12 (+ ribs)
+  const tY0 = 0.90, tStep = 0.285;
+  for (let k = 0; k < 12; k++) {
+    const y = tY0 - k * tStep;
+    place(makeVertebra('T', k, 0.80 + k * 0.018), y);
+    for (const s of [-1, 1]) place(makeRib(y, k, s), 0);
+  }
+  // lumbar L1–L5
+  for (let k = 0; k < 5; k++) place(makeVertebra('L', k, 1.0 + k * 0.012), -2.62 - k * 0.37);
+  // sacrum + coccyx
+  place(makeSacrum(-4.38, -5.92), 0);
+  for (let k = 0; k < 3; k++) place(bBall(0.12 - k * 0.025, [0, 0, 0.60 + 0.06 * k], [1.1, 0.8, 0.9]), -6.04 - k * 0.17);
+
+  const geo = mergeParts(parts);
+  // bake warm bone shading: subtle mottling + darker recesses inside the neural canal
+  const pos = geo.attributes.position, colors = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const m = fbm3(x * 5 + 3, y * 5, z * 5, 3) * 0.10;
+    const canal = Math.exp(-((x * x) / 0.06 + ((z - 0.0) * (z - 0.0)) / 0.09)) * 0.22;
+    const k = 1 - canal;
+    setVertexColor(colors, i, (0.93 + m) * k, (0.88 + m) * k, (0.77 + m) * k);
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   return geo;
 }
 
@@ -975,14 +1275,14 @@ function tissueMat(color, opts = {}) {
 }
 
 const MAT = {
-  // Cerebral cortex — grey-pink, satin-matte like a real specimen/model, not glossy plastic
-  brain:      tissueMat(0xc79483, { roughness: 0.6, clearcoat: 0.2, clearcoatRoughness: 0.4, vertexColors: true }),
-  // Cerebellum — slightly deeper pink-tan, fine folia texture does the visual work
-  cerebellum: tissueMat(0xc98577, { roughness: 0.55, clearcoat: 0.22, clearcoatRoughness: 0.38, vertexColors: true }),
-  // Brainstem — denser, redder tissue
-  brainstem:  tissueMat(0xaf6f5e, { roughness: 0.5, clearcoat: 0.25, clearcoatRoughness: 0.35 }),
-  // Spinal cord — pale ivory white matter
-  spinal:     tissueMat(0xe6d9c4, { roughness: 0.55, clearcoat: 0.15 }),
+  // Cerebral cortex — glossy wet pink; colour lives in the baked vertex colours (crowns light, sulci dark)
+  brain:      tissueMat(0xffffff, { roughness: 0.36, clearcoat: 0.6, clearcoatRoughness: 0.2, vertexColors: true }),
+  // Cerebellum — salmon-pink folia
+  cerebellum: tissueMat(0xffffff, { roughness: 0.42, clearcoat: 0.45, clearcoatRoughness: 0.28, vertexColors: true }),
+  // Brainstem — cream white matter with a soft sheen
+  brainstem:  tissueMat(0xffffff, { roughness: 0.42, clearcoat: 0.4, clearcoatRoughness: 0.3, vertexColors: true }),
+  // Spinal cord — same cream white matter
+  spinal:     tissueMat(0xe9dcc2, { roughness: 0.45, clearcoat: 0.35, clearcoatRoughness: 0.3 }),
   // Peripheral nerves — creamy pale fiber bundles, opaque
   peripheral: tissueMat(0xf0e2c4, { roughness: 0.5, clearcoat: 0.3, clearcoatRoughness: 0.3 }),
   // Cranial nerves — slightly whiter/pinker cream
@@ -992,6 +1292,8 @@ const MAT = {
   // Neural signal pulses stay stylized/glowing — this is a data overlay, not tissue
   signal:     new THREE.MeshBasicMaterial({ color: 0xfbbf24, transparent: true, opacity: 0.9 }),
 };
+// Bone — warm ivory with baked mottling/shadow (fades to x-ray when the nervous system is the focus)
+const boneMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.58, metalness: 0, clearcoat: 0.14, clearcoatRoughness: 0.5 });
 
 /* ─────────────────────────────────────────────
    PROCEDURAL GEOMETRY HELPERS
@@ -1025,66 +1327,35 @@ const cranialGrp    = new THREE.Group();
 const autonomicGrp  = new THREE.Group();
 const labelGrp      = new THREE.Group();
 const signalGrp     = new THREE.Group();
+const skeletonGrp   = new THREE.Group();
 
-rootGroup.add(cnsGroup, peripheralGrp, cranialGrp, autonomicGrp, labelGrp, signalGrp);
-
-/* ─────────────────────────────────────────────
-   BUILD BRAIN
-───────────────────────────────────────────── */
-
-// Cerebrum hemispheres — each carved with the actual named sulci (central
-// sulcus, lateral/Sylvian fissure, parieto-occipital sulcus), correctly
-// mirrored left vs right, plus their own tertiary gyral noise seed.
-const leftCerebrumGeo  = sculptHemisphereGeometry(1.45, 96, 72, true, 1.7);   // mirror=true -> left hemisphere
-const rightCerebrumGeo = sculptHemisphereGeometry(1.45, 96, 72, false, 8.4);  // mirror=false -> right hemisphere
-
-// Left hemisphere
-const leftHemi = addBlob(leftCerebrumGeo, MAT.brain, [-0.32, 5.4, 0.05], [1,0.9,1.1], 0,-0.05,0, 'brain');
-// Right hemisphere
-const rightHemi = addBlob(rightCerebrumGeo, MAT.brain, [0.32, 5.4, 0.05], [1,0.9,1.1], 0,0.05,0, 'brain');
-
-// Slightly flatten to look more brain-like
-leftHemi.scale.y = 0.85;
-rightHemi.scale.y = 0.85;
-
-// Corpus callosum connection
-const callosumGeo = new THREE.CylinderGeometry(0.28, 0.28, 0.7, 16);
-const callosum = new THREE.Mesh(callosumGeo, MAT.brain.clone());
-callosum.position.set(0, 5.2, 0.1);
-callosum.rotation.z = Math.PI / 2;
-callosum.userData.structureId = 'brain';
-
-// Frontal lobes bump
-const frontalL = addBlob(foldedSphereGeometry(0.85,44,32,2.2,0.05,3.0), MAT.brain, [-0.7, 5.6, 1.1], [1.1,0.9,1], 0,0.2,0, 'brain');
-const frontalR = addBlob(foldedSphereGeometry(0.85,44,32,6.6,0.05,3.0), MAT.brain, [0.7, 5.6, 1.1], [1.1,0.9,1], 0,-0.2,0, 'brain');
-
-// Temporal lobes
-const temporalL = addBlob(foldedSphereGeometry(0.75,40,30,3.3,0.045,3.1), MAT.brain, [-1.55, 4.6, 0.4], [1,0.85,0.95], 0,0,0.25, 'brain');
-const temporalR = addBlob(foldedSphereGeometry(0.75,40,30,7.7,0.045,3.1), MAT.brain, [1.55, 4.6, 0.4], [1,0.85,0.95], 0,0,-0.25, 'brain');
-
-// Occipital lobe
-const occipital = addBlob(foldedSphereGeometry(0.9,42,30,4.4,0.05,3.0), MAT.brain, [0, 5.1, -1.3], [1.2,0.9,1], 0,0,0, 'brain');
-
-cnsGroup.add(leftHemi, rightHemi, callosum, frontalL, frontalR, temporalL, temporalR, occipital);
+rootGroup.add(cnsGroup, peripheralGrp, cranialGrp, autonomicGrp, labelGrp, signalGrp, skeletonGrp);
 
 /* ─────────────────────────────────────────────
-   CEREBELLUM
+   BUILD BRAIN  (cerebrum · cerebellum · brainstem)
 ───────────────────────────────────────────── */
-const cereb  = addBlob(foliaSphereGeometry(0.9,56,40,1.0,0.03,17,'x'), MAT.cerebellum, [0, 3.9, -1.1], [1.6,0.8,1.1], 0,0,0, 'cerebellum');
-const cerebL = addBlob(foliaSphereGeometry(0.7,44,32,2.0,0.028,17,'x'), MAT.cerebellum, [-0.8, 3.85, -1.2], [1,0.75,0.9], 0,0,0, 'cerebellum');
-const cerebR = addBlob(foliaSphereGeometry(0.7,44,32,3.0,0.028,17,'x'), MAT.cerebellum, [0.8, 3.85, -1.2], [1,0.75,0.9], 0,0,0, 'cerebellum');
-cnsGroup.add(cereb, cerebL, cerebR);
+function addDense(geo, mat, id, proxyGeo, group) {
+  const m = new THREE.Mesh(geo, mat.clone());
+  m.userData.structureId = id;
+  m.castShadow = true; m.receiveShadow = true;
+  if (proxyGeo) setRaycastProxy(m, proxyGeo);
+  group.add(m);
+  return m;
+}
+// Two cerebral hemispheres, each with its own gyral pattern; fused flat at the longitudinal fissure
+addDense(buildHemisphere(-1, { detail: 96, seed: 1.7 }), MAT.brain, 'brain', buildHemisphere(-1, { detail: 14, gyri: false }), cnsGroup);
+addDense(buildHemisphere( 1, { detail: 96, seed: 8.4 }), MAT.brain, 'brain', buildHemisphere( 1, { detail: 14, gyri: false }), cnsGroup);
 
-/* ─────────────────────────────────────────────
-   BRAINSTEM
-───────────────────────────────────────────── */
-// Midbrain
-const midbrain = addBlob(new THREE.CylinderGeometry(0.36,0.4,0.55,20), MAT.brainstem, [0, 4.62, 0.18], [1,1,1], 0,0,0, 'brainstem');
-// Pons — the ventral bulge that makes the brainstem visually recognizable
-const pons = addBlob(new THREE.SphereGeometry(0.42,24,16), MAT.brainstem, [0, 4.05, 0.34], [1.3,0.82,1.3], 0,0,0, 'brainstem');
-// Medulla — tapers down toward the spinal cord
-const medulla = addBlob(new THREE.CylinderGeometry(0.26,0.36,0.72,16), MAT.brainstem, [0, 3.63, 0.18], [1,1,0.95], 0,0,0, 'brainstem');
-cnsGroup.add(midbrain, pons, medulla);
+// Cerebellum — vermis + two lobes with fine transverse folia
+(function () {
+  const proxy = new THREE.IcosahedronGeometry(1, 8);
+  const pp = proxy.attributes.position;
+  for (let i = 0; i < pp.count; i++) pp.setXYZ(i, CEREB_C.x + pp.getX(i) * 1.1, CEREB_C.y + pp.getY(i) * 0.5, CEREB_C.z + pp.getZ(i) * 0.66);
+  addDense(buildCerebellum({ detail: 110 }), MAT.cerebellum, 'cerebellum', proxy, cnsGroup);
+})();
+
+// Brainstem — midbrain, pons, medulla in one lofted form
+addDense(buildBrainstem(), MAT.brainstem, 'brainstem', null, cnsGroup);
 
 /* ─────────────────────────────────────────────
    SPINAL CORD
@@ -1122,24 +1393,15 @@ for (let i = 0; i < 8; i++) {
 }
 
 /* ─────────────────────────────────────────────
-   VERTEBRAL COLUMN (decorative)
+   VERTEBRAL COLUMN + RIBS  (toggle: Skeleton)
 ───────────────────────────────────────────── */
-const vertebraCounts = [7,12,5,5];
-const vertebraYStarts = [2.8, 1.8, -1.2, -2.6];
-const vertebraSizes = [0.38, 0.42, 0.46, 0.44];
-
-vertebraCounts.forEach((count, region) => {
-  const yStart = vertebraYStarts[region];
-  const spacing = (region === 0) ? 0.38 : (region === 1) ? 0.34 : 0.37;
-  for (let i = 0; i < count; i++) {
-    const vGeo = new THREE.BoxGeometry(0.7, 0.18, 0.5);
-    const vMat = new THREE.MeshPhysicalMaterial({ color: 0xd9cdb0, roughness: 0.75, metalness: 0.0, clearcoat: 0.15 });
-    const v = new THREE.Mesh(vGeo, vMat);
-    v.position.set(0, yStart - i * spacing, -0.05);
-    v.castShadow = true;
-    cnsGroup.add(v);
-  }
-});
+try {
+  const skeletonMesh = new THREE.Mesh(buildSkeletonGeometry(), boneMat);
+  skeletonMesh.castShadow = true; skeletonMesh.receiveShadow = true;
+  skeletonGrp.add(skeletonMesh);
+} catch (err) {
+  console.error('Skeleton failed to build — the rest of the scene still loads:', err);
+}
 
 /* ─────────────────────────────────────────────
    CRANIAL NERVES (12 pairs)
@@ -1388,7 +1650,7 @@ autonomicGrp.add(celiac);
    FLOATING LABELS (canvas sprites)
 ───────────────────────────────────────────── */
 const labelDefs = [
-  { text: 'Cerebrum', pos: new THREE.Vector3(0, 6.6, 0), id: 'brain' },
+  { text: 'Cerebrum', pos: new THREE.Vector3(0, 7.1, 0), id: 'brain' },
   { text: 'Cerebellum', pos: new THREE.Vector3(0, 3.5, -2), id: 'cerebellum' },
   { text: 'Brainstem', pos: new THREE.Vector3(1.6, 4.2, 0.5), id: 'brainstem' },
   { text: 'Spinal Cord', pos: new THREE.Vector3(1.4, 0, 0.3), id: 'spinalCord' },
@@ -1719,7 +1981,10 @@ const toggleMap = {
   'tog-autonomic': autonomicGrp,
   'tog-labels': labelGrp,
   'tog-signals': signalGrp,
+  'tog-skeleton': skeletonGrp,
 };
+let boneXray = false, boneOpacity = 1;
+document.getElementById('tog-xray').addEventListener('change', e => { boneXray = e.target.checked; });
 
 Object.entries(toggleMap).forEach(([id, group]) => {
   document.getElementById(id).addEventListener('change', e => {
@@ -1862,6 +2127,18 @@ function animate() {
   if (!prefersReducedMotion) {
     rootGroup.rotation.y = Math.sin(elapsed * 0.12) * 0.04;
     rootGroup.position.y = Math.sin(elapsed * 0.25) * 0.04;
+  }
+
+  // Bones fade to x-ray when the cord / nerves are selected (or X-ray is on) so nothing is hidden
+  {
+    const deepSel = selectedId === 'spinalCord' || selectedId === 'peripheralNerves' || selectedId === 'sympathetic';
+    const targetOp = (boneXray || deepSel) ? 0.2 : 1;
+    boneOpacity += (targetOp - boneOpacity) * Math.min(1, delta * 6);
+    if (Math.abs(boneMat.opacity - boneOpacity) > 0.002) {
+      const t = boneOpacity < 0.995;
+      if (boneMat.transparent !== t) { boneMat.transparent = t; boneMat.depthWrite = !t; boneMat.needsUpdate = true; }
+      boneMat.opacity = boneOpacity;
+    }
   }
 
   // Neural signal pulses
